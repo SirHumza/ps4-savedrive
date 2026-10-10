@@ -1,0 +1,8 @@
+*.elf
+*.fself
+*.o
+build/
+__pycache__/
+.superpowers/
+config.json
+.DS_Store
