@@ -71,6 +71,11 @@ pulls the log back to the Mac.
   retries on the next jailbreak.
 - **Chunked responses.** Server responses using `Transfer-Encoding: chunked`
   (Drive occasionally does this) are handled.
+- **No double runs.** A lock at `/data/savedrive/run.lock` stops a second
+  payload instance (an accidental double send) from running a parallel backup
+  over the same zip and state files. A lock whose process is gone, or is older
+  than 24 hours, is taken over automatically, so a crash or power loss cannot
+  wedge future runs.
 - **Log rotation.** `run.log` is capped at 512 KB.
 
 ## Build

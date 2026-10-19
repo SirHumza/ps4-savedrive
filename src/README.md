@@ -35,6 +35,10 @@ Missing or bad config logs one line and exits without blocking boot.
 `/data/savedrive/run.log`, mirrored to klog (TCP 3232). One line per title:
 `TITLE <user>+<title> zip|skip|fail|retry <bytes>`, then a `SUMMARY` line.
 
+A second instance started while one is running logs `already running, exit`
+and stops; its lock (`/data/savedrive/run.lock`) is taken over automatically
+when the previous process is gone or the lock is older than 24 hours.
+
 ## Steady state
 
 Each jailbreak is an incremental backup: unchanged titles are skipped using

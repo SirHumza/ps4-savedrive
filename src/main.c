@@ -4,13 +4,16 @@
  * blocks boot: every failure is logged and the payload still exits 0. */
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "drive.h"
+#include "lock.h"
 #include "log.h"
 #include "manifest.h"
 #include "sd_cfg.h"
@@ -21,6 +24,7 @@
 #define SD_STATE_DIR SD_DATA "/state"
 #define SD_CFG_FILE SD_DATA "/config.json"
 #define SD_LOG_FILE SD_DATA "/run.log"
+#define SD_LOCK_FILE SD_DATA "/run.lock"
 #define SD_PATH_MAX 1024
 
 /* PS4 libc has the symbol but not always a declaration for it. */
@@ -214,6 +218,22 @@ int main(void) {
   mkdir(SD_DATA, 0700);
   mkdir(SD_STATE_DIR, 0700);
   log_init(SD_LOG_FILE);
+
+  /* Two concurrent runs would write the same zip/state paths and could
+   * upload a corrupt zip that the manifest then skips forever. A lock
+   * failure (odd filesystem state) is not worth losing a backup over, so
+   * only a "busy" verdict skips the run. */
+  {
+    int lr = sd_lock_acquire(SD_LOCK_FILE);
+    if (lr == 1) {
+      log_msg("already running, exit");
+      return 0;
+    }
+    if (lr < 0)
+      log_msg("lock unavailable errno=%d, continuing", errno);
+    else
+      atexit(sd_lock_release);
+  }
 
   if (sd_cfg_load(SD_CFG_FILE, &cfg) != 0) {
     log_msg("config %s unavailable", SD_CFG_FILE);

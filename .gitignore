@@ -9,4 +9,5 @@ config.json
 tests/test_sd_cfg
 tests/test_sdzip
 tests/test_sddrive
+tests/test_sdlock
 *.dSYM/
