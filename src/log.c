@@ -88,9 +88,14 @@ static FILE *open_log(const char *want){
 /* Lazy re-open cadence: mounts can appear after startup and the data directory
  * is only created later in the run, so keep retrying instead of giving up. */
 static unsigned s_retry = 0;
+static char g_want[256];
 
 void log_init(const char *path) {
     if(g_log) return;
+    if(path && path[0]){
+        strncpy(g_want, path, sizeof g_want - 1);
+        g_want[sizeof g_want - 1] = 0;
+    }
     g_log = open_log(path);
     /* klog mirror: survives even when every mount is invisible */
     g_klog = open("/dev/klog", O_WRONLY);
@@ -101,7 +106,10 @@ void log_init(const char *path) {
  * doing so pinned logging to an unreachable stream permanently, even after the
  * data directory became writable. */
 static FILE *log_out(void){
-    if(!g_log && (s_retry++ & 0x1fu) == 0) g_log = open_log(NULL);
+    /* Retry our own path first: a transient failure at init must not latch
+     * logging onto the generic fallbacks (deploy.sh fetches run.log). */
+    if(!g_log && (s_retry++ & 0x1fu) == 0)
+        g_log = open_log(g_want[0] ? g_want : NULL);
     return g_log ? g_log : stderr;
 }
 
