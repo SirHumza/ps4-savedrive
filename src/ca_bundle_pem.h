@@ -1,6 +1,6 @@
 /* ca_bundle_pem.h - curated trust anchors (generated, do not edit).
- * 24 roots for GitHub/Discord/Sony/pkg-zone. Regenerate with
- * scripts/make_ca_bundle.py.
+ * 24 roots covering Google Drive/OAuth (GTS R1-R4), GitHub, Sony and
+ * pkg-zone. Vendored from SirHumza/orbisRPC scripts/make_ca_bundle.py.
  */
 #ifndef ORBISRPC_CA_BUNDLE_PEM_H
 #define ORBISRPC_CA_BUNDLE_PEM_H
