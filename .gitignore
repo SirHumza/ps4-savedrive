@@ -7,3 +7,4 @@ __pycache__/
 config.json
 .DS_Store
 tests/test_sd_cfg
+tests/test_sdzip
