@@ -54,6 +54,11 @@ pulls the log back to the Mac.
    and retried on the next jailbreak. The payload always exits 0, so a network
    problem can never block boot.
 
+The loader hands the payload the standard homebrew world — uid 0 with the real
+filesystem root (`ROOTVNODE`) and PRISON0 (verified in the ps4-payload-dev
+elfldr sources, whose loader model GoldHEN's PayLoader follows) — so
+`/user/home` and `/data` are directly readable.
+
 ## Stability
 
 - **Resumable chunks.** Each zip goes up in 8 MiB chunks. If the server
@@ -73,9 +78,11 @@ pulls the log back to the Mac.
   (Drive occasionally does this) are handled.
 - **No double runs.** A lock at `/data/savedrive/run.lock` stops a second
   payload instance (an accidental double send) from running a parallel backup
-  over the same zip and state files. A lock whose process is gone, or is older
-  than 24 hours, is taken over automatically, so a crash or power loss cannot
-  wedge future runs.
+  over the same zip and state files. A lock whose process is gone, whose
+  timestamp is unusable (missing, zero, or far in the future after a clock
+  rollback), or is older than 24 hours is taken over automatically, so a crash
+  or power loss cannot wedge future runs; release only removes a lock this
+  process still owns.
 - **Log rotation.** `run.log` is capped at 512 KB.
 
 ## Build
