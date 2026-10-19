@@ -84,7 +84,7 @@ static jl_val_t *parse_array(jl_parse_t *p, int depth) {
     if(p->cur<p->end && *p->cur==']'){p->cur++;return v;}
     while(p->cur<p->end){
         jl_val_t *e=parse_value_depth(p, depth+1); if(p->err){jl_free(v);return NULL;}
-        if(!v->child)v->child=e;else{tail->next=e;}
+        if(tail)tail->next=e;else v->child=e;
         tail=e; v->count++;
         skip_ws(p);
         if(p->cur<p->end&&*p->cur==','){p->cur++;skip_ws(p);continue;}
@@ -109,7 +109,7 @@ static jl_val_t *parse_object(jl_parse_t *p, int depth) {
         if(!pair){ p->err=1; jl_free(key); jl_free(val); jl_free(v); return NULL; }
         pair->str=key->str; pair->strlen=key->strlen; pair->child=val;
         free(key); /* moved key->str into pair */
-        if(!v->child)v->child=pair;else{tail->next=pair;}
+        if(tail)tail->next=pair;else v->child=pair;
         tail=pair; v->count++;
         skip_ws(p);
         if(p->cur<p->end&&*p->cur==','){p->cur++;skip_ws(p);continue;}
