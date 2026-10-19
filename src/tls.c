@@ -229,7 +229,11 @@ int tls_write(tls_ctx_t *t, const void *buf, size_t len){
     int64_t dl = orbis_mono_s() + 10;
     while(done < len){
         int r = mbedtls_ssl_write(&t->ssl, p + done, len - done);
-        if(r > 0){ done += (size_t)r; continue; }
+        /* Any progress refreshes the deadline: the 10 s bound is for a
+         * stalled connection (no bytes moving), not an 8 MiB chunk over a
+         * slow link. Otherwise links under ~0.8 MB/s fail every chunk on
+         * every boot and the backup never completes. */
+        if(r > 0){ done += (size_t)r; dl = orbis_mono_s() + 10; continue; }
         if(r != MBEDTLS_ERR_SSL_WANT_READ && r != MBEDTLS_ERR_SSL_WANT_WRITE){
             log_msg("tls: write fail %d", r);
             return -1;
