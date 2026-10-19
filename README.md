@@ -24,12 +24,22 @@ URL), then copy the printed JSON to `/data/savedrive/config.json` on the PS4.
 
 ```
 make -C src
-scripts/deploy.sh deploy   # build/savedrive.elf -> /data/payloads/savedrive.bin
+scripts/deploy.sh deploy   # build/savedrive.elf -> /data/payloads/savedrive.elf
 ```
 
-**3. Autorun.** Add `savedrive.bin` to `/data/payloads/payloads.ini`; it now
-runs on every jailbreak. Progress lands in `/data/savedrive/run.log` and on
-klog (TCP 3232). `scripts/deploy.sh fetch` pulls the log back to the Mac.
+**3. Run it after each jailbreak.** With GoldHEN's PayLoader server enabled,
+send the ELF from your Mac:
+
+```
+nc <ps4-ip> 9090 < build/savedrive.elf
+```
+
+GoldHEN 2.4b18.8+ loads both ELF and BIN payloads. There is no payload autorun
+in public GoldHEN builds (no `payloads.ini`); GoldHEN 2.4b18.10+ adds an
+in-menu PayLoader LaunchPad/AutoRun queue, which you configure from its menu.
+Payload Guest cannot run this ELF (it executes flat shellcode). Progress lands
+in `/data/savedrive/run.log` and on klog (TCP 3232); `scripts/deploy.sh fetch`
+pulls the log back to the Mac.
 
 ## How it works
 
@@ -103,8 +113,8 @@ because a pre-created `folder_id` cannot be addressed with `drive.file`.
 ## Troubleshooting
 
 - **Nothing appears on Drive.** Check `/data/savedrive/run.log`. No file at
-  all means the payload did not run — confirm `savedrive.bin` is in
-  `payloads.ini` and that `make -C src check` passes. `config ... unavailable`
+  all means the payload did not run — confirm you sent `build/savedrive.elf`
+  to port 9090 and that `make -C src check` passes. `config ... unavailable`
   means step 1 was skipped or the JSON landed in the wrong path.
 - **A title keeps failing.** Look for `TITLE <user>+<title> fail|retry <bytes>`
   in the log. `retry` is network/5xx (it resumes next boot); `fail` is

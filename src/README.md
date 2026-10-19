@@ -7,16 +7,22 @@
 
 ## Deploy
 
-    scripts/deploy.sh deploy   # -> /data/payloads/savedrive.bin
-    scripts/deploy.sh probe    # -> /data/payloads/sdprobe.bin
+    scripts/deploy.sh deploy   # -> /data/payloads/savedrive.elf
+    scripts/deploy.sh probe    # -> /data/payloads/sdprobe.elf
     scripts/deploy.sh fetch    # -> build/run.log, build/probe.txt
 
 Override the console with `PS4_HOST` / `PS4_PORT` (default 192.168.1.136:2121).
 
-## Autorun
+## Running
 
-Add `savedrive.bin` to `/data/payloads/payloads.ini`. It then runs once on
-every jailbreak and exits; nothing stays resident.
+There is no payload autorun in public GoldHEN builds (and no `payloads.ini`).
+After each jailbreak, send the ELF to GoldHEN's PayLoader server:
+
+    nc <ps4-ip> 9090 < build/savedrive.elf
+
+GoldHEN 2.4b18.8+ accepts ELF and BIN payloads. The payload runs once and
+exits; nothing stays resident. Payload Guest cannot run this ELF because it
+executes flat shellcode.
 
 ## Config
 

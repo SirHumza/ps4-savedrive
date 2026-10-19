@@ -44,11 +44,11 @@
 - [ ] **Step 2: Build** with the OpenOrbis SDK
 
 Run: `make -C src/probe`
-Expected: clean build, `probe.elf` + `.fself`, no `libkernel.so` in link
+Expected: clean build, `probe.elf`, no `libkernel.so` in link
 
 - [ ] **Step 3: Deploy via FTP** to `/data/payloads/` and have the user launch it once via BinLoader
 
-Run (Mac): FTP STOR `probe.elf` → `/data/payloads/sdprobe.bin`
+Run (Mac): FTP STOR `probe.elf` → `/data/payloads/sdprobe.elf`
 Expected: remote size matches local
 
 - [ ] **Step 4: User pastes back `probe.txt`; verify** every title dir shows `READ_OK` and byte totals ≈ FTP-measured 2.07GB + 118MB
@@ -146,20 +146,20 @@ git commit -m "feat: Drive resumable upload over tls"
 
 **Files:**
 - Create: `src/main.c`, `src/Makefile`, `src/README.md` (user runbook)
-- Modify: PS4 `/data/payloads/payloads.ini` (add `savedrive.bin` autorun line — FTP edit, user confirms reboot behavior)
+- Modify: none on the PS4 — no `payloads.ini` exists in GoldHEN or Payload Guest; the payload is sent to GoldHEN's PayLoader (port 9090) after each jailbreak
 - Test: console run, evidence = `/data/savedrive/run.log` + Drive folder listing
 
 **Interfaces:**
 - Consumes: `sd_zip_title`, `sd_manifest_skip`, `sd_drive_put`, `sd_cfg_load`
-- Produces: `/data/payloads/savedrive.bin` staged; `run.log` lines `TITLE <id> <zip|skip|fail> <bytes>`
+- Produces: `/data/payloads/savedrive.elf` staged; `run.log` lines `TITLE <id> <zip|skip|fail> <bytes>`
 
 - [ ] **Step 1: Write `main.c`**: load config → refresh access token → walk both users (probe paths) → manifest check → zip → upload → log line per title → summary line; exit 0 always (never block boot on failure)
 - [ ] **Step 2: Build, link-check**
 
 Run: `make -C src`
-Expected: clean, no `libkernel.so`, `.fself` produced
+Expected: clean, no `libkernel.so`, raw ELF produced
 
-- [ ] **Step 3: Stage via FTP** to `/data/payloads/savedrive.bin`, verify remote size; add autorun line to `payloads.ini` (user reboots into jailbreak at will)
+- [ ] **Step 3: Stage via FTP** to `/data/payloads/savedrive.elf`, verify remote size (staging only; the user sends `build/savedrive.elf` to port 9090 after each jailbreak)
 - [ ] **Step 4: User runs one jailbreak cycle**, pastes `run.log`; verify first title zips appear in the Drive folder (user confirms visually), failures show `fail` not silent skip
 - [ ] **Step 5: Fix pass on real failures only** (one round, each fix host-tested first), then commit
 
@@ -175,7 +175,7 @@ git commit -m "feat: backup payload + autorun"
 - [ ] **Step 1: User runs 1–2 more jailbreak cycles** until `run.log` shows all titles `zip` then `skip`
 - [ ] **Step 2: Verify**: Drive folder holds one zip per `user+title` (`1898cd02+CUSA…` naming), count matches probe title count; download one zip on Mac, `unzip -l` lists save files
 - [ ] **Step 3: Write the steady-state note** into `src/README.md` (each jailbreak = incremental backup; full re-upload if manifest deleted; rest-mode mid-run resumes next boot) and commit
-- [ ] **Step 4: Delete staged build artifacts** from `/data/payloads` that aren't the autorun entry (`sdprobe.bin`)
+- [ ] **Step 4: Delete staged build artifacts** from `/data/payloads` that aren't needed by your loader (`sdprobe.elf`)
 
 ## Self-review
 

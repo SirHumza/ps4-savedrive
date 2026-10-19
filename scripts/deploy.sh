@@ -28,11 +28,11 @@ get() {
 case "${1:-}" in
 deploy)
   [ -f "$ELF" ] || { echo "missing $ELF (run make -C src)" >&2; exit 1; }
-  put "$ELF" /data/payloads/savedrive.bin
+  put "$ELF" /data/payloads/savedrive.elf
   ;;
 probe)
   [ -f "$PROBE" ] || { echo "missing $PROBE (run make -C src/probe)" >&2; exit 1; }
-  put "$PROBE" /data/payloads/sdprobe.bin
+  put "$PROBE" /data/payloads/sdprobe.elf
   ;;
 fetch)
   mkdir -p "$OUT"
