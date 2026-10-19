@@ -24,8 +24,10 @@
 #include "log.h"
 
 #ifdef SD_PS4
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -178,9 +180,10 @@ static int dechunk(char *buf, size_t len) {
 
 /* Writes one request (headers, then optional binary body) and reads the full
  * response. Handles responses split across any number of io->read calls:
- * headers are accumulated until CRLFCRLF, then either Content-Length bytes,
- * a chunked body, or EOF for connection-close responses. Returns 0 on a
- * complete exchange, -2 on any transport error. */
+ * headers are accumulated until CRLFCRLF, then either Content-Length bytes
+ * or a chunked body. A response with neither (Google always sends one) is
+ * taken as whatever arrived with the headers. Returns 0 on a complete
+ * exchange, -2 on any transport error. */
 static int sd_http_roundtrip(sd_io_t *io, const char *hdr, size_t hdr_len,
                              const void *body, size_t body_len, char *buf,
                              size_t cap, sd_http_t *out) {
@@ -904,11 +907,18 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
 
 /* Resolves host and connects a TCP socket, returning the fd or -1.
  * The payload SDK's libc provides BSD sockets (same route orbisRPC's
- * SDK build uses); no orbis/Net.h and no app-world linkage. */
+ * SDK build uses); no orbis/Net.h and no app-world linkage.
+ *
+ * connect is non-blocking with a 10 s select deadline and walks every
+ * resolved address: a dropped SYN (no route, dead resolver answer) then
+ * fails this title in seconds instead of parking the payload on the
+ * system TCP retry window, and one unreachable address does not kill an
+ * otherwise working run. The fd stays non-blocking for the TLS pump. */
 static int sd_tcp_connect(const char *host) {
-  struct addrinfo hints, *res = NULL;
+  struct addrinfo hints, *res = NULL, *ai;
+  struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
   char portbuf[16];
-  int fd;
+  int fd = -1;
 
   memset(&hints, 0, sizeof hints);
   hints.ai_family = AF_INET;
@@ -919,28 +929,42 @@ static int sd_tcp_connect(const char *host) {
     return -1;
   }
 
-  fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    log_msg("drive: socket fail");
-    freeaddrinfo(res);
-    return -1;
-  }
-  {
-    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-  }
-  if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-    log_msg("drive: connect fail %s", host);
-    close(fd);
-    freeaddrinfo(res);
-    return -1;
-  }
-  freeaddrinfo(res);
-  {
-    int fl = fcntl(fd, F_GETFL, 0);
+  for (ai = res; ai; ai = ai->ai_next) {
+    struct timeval ctv = tv;
+    int fl, rc;
+
+    fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0)
+      continue;
+    fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0)
       fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+    if (rc != 0 && errno == EINPROGRESS) {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(fd, &wfds);
+      if (select(fd + 1, NULL, &wfds, NULL, &ctv) > 0) {
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+          break; /* connected */
+      }
+      rc = -1; /* timeout, refused, or unreachable */
+    }
+    if (rc != 0) {
+      close(fd);
+      fd = -1;
+    } else {
+      break;
+    }
   }
+  freeaddrinfo(res);
+  if (fd < 0) {
+    log_msg("drive: connect fail %s", host);
+    return -1;
+  }
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
   return fd;
 }
 
