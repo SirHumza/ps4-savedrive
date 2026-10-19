@@ -91,6 +91,29 @@ int main(void) {
   assert(sd_lock_acquire(lock) == 1);
   unlink(lock);
 
+  /* Live pid but an unusable (missing or zero) timestamp -> takeover. */
+  snprintf(raw, sizeof raw, "%ld\n", (long)getpid());
+  write_raw(lock, raw);
+  assert(sd_lock_acquire(lock) == 0);
+  sd_lock_release();
+  snprintf(raw, sizeof raw, "%ld 0\n", (long)getpid());
+  write_raw(lock, raw);
+  assert(sd_lock_acquire(lock) == 0);
+  sd_lock_release();
+
+  /* Live pid, timestamp far in the future (clock rollback) -> takeover. */
+  snprintf(raw, sizeof raw, "%ld %ld\n", (long)getpid(),
+           (long)time(NULL) + 25 * 60 * 60);
+  write_raw(lock, raw);
+  assert(sd_lock_acquire(lock) == 0);
+
+  /* Release must not unlink a lock that belongs to another pid. */
+  snprintf(raw, sizeof raw, "999999 %ld\n", (long)time(NULL));
+  write_raw(lock, raw);
+  sd_lock_release();
+  assert(access(lock, F_OK) == 0);
+  unlink(lock);
+
   /* Malformed or empty contents -> takeover. */
   write_raw(lock, "junk");
   assert(sd_lock_acquire(lock) == 0);

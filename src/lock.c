@@ -1,11 +1,12 @@
 /* lock.c - single-instance guard (see lock.h).
  *
  * The lock file holds "<pid> <unix_time>". A lock is stale when its pid is
- * gone (kill(pid, 0) -> ESRCH) or when it is older than SD_LOCK_STALE_SECS
- * (bounds the damage from pid reuse after a crash). Anything unreadable or
- * malformed is treated as stale: the worst case of a wrong takeover is the
- * concurrent run we are guarding against, the worst case of a stuck lock is
- * a silent permanent backup outage.
+ * gone (kill(pid, 0) -> ESRCH), when its timestamp is unusable, when the
+ * timestamp is implausibly far in the future (clock rollback), or when it is
+ * older than SD_LOCK_STALE_SECS (bounds the damage from pid reuse after a
+ * crash). Anything unreadable or malformed is treated as stale: the worst
+ * case of a wrong takeover is the concurrent run we are guarding against,
+ * the worst case of a stuck lock is a silent permanent backup outage.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 #include "lock.h"
 
 #define SD_LOCK_STALE_SECS (24L * 60 * 60)
+#define SD_LOCK_FUTURE_SECS 300L
 
 static char lock_path[256];
 
@@ -56,7 +58,9 @@ static int lock_alive(const char *contents) {
 
   if (pid_alive(pid)) {
     long now = (long)time(NULL);
-    if (ts > 0 && now > ts && now - ts > SD_LOCK_STALE_SECS)
+    if (ts <= 0 || ts - now > SD_LOCK_FUTURE_SECS)
+      return 0;
+    if (now - ts > SD_LOCK_STALE_SECS)
       return 0;
     return 1;
   }
@@ -106,7 +110,16 @@ int sd_lock_acquire(const char *path) {
 
 void sd_lock_release(void) {
   if (lock_path[0]) {
-    unlink(lock_path);
+    char buf[64];
+    int fd = open(lock_path, O_RDONLY);
+    if (fd >= 0) {
+      ssize_t n = read(fd, buf, sizeof buf - 1);
+      const char *p = buf;
+      close(fd);
+      buf[n > 0 ? n : 0] = 0;
+      if (parse_long(&p) == (long)getpid())
+        unlink(lock_path);
+    }
     lock_path[0] = 0;
   }
 }
