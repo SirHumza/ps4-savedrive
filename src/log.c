@@ -127,7 +127,7 @@ void log_msg(const char *fmt, ...) {
     va_end(ap);
     if (g_klog >= 0) {
         char line[512];
-        int n = snprintf(line, sizeof line, "[orbisRPC %s] ", ts);
+        int n = snprintf(line, sizeof line, "[savedrive %s] ", ts);
         if (n > 0 && n < (int)sizeof line)
             n += vsnprintf(line + n, sizeof line - n, fmt, ap2);
         if (n > 0) { if (n >= (int)sizeof line) n = (int)sizeof line - 1; line[n++] = '\n'; (void)write(g_klog, line, (size_t)n); }

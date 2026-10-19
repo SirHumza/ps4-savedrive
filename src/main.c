@@ -2,6 +2,7 @@
  *
  * Runs once per jailbreak from the payload autorun list. It never blocks
  * boot: every failure is logged and the payload still exits 0. */
+#include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 
 #define SD_HOME "/user/home"
 #define SD_DATA "/data/savedrive"
+#define SD_STATE_DIR SD_DATA "/state"
 #define SD_CFG_FILE SD_DATA "/config.json"
 #define SD_LOG_FILE SD_DATA "/run.log"
 #define SD_PATH_MAX 1024
@@ -27,6 +29,20 @@ extern struct tm *gmtime_r(const time_t *, struct tm *);
 /* Signature of a title: total bytes of regular files plus the newest mtime.
  * lstat everywhere so a symlink is never followed. */
 #define SD_WALK_MAX_DEPTH 64
+
+/* Names become manifest fields, state fields and Drive file names, all of
+ * which are whitespace-delimited or line-based. Real user ids and title ids
+ * are alphanumeric; anything else is skipped rather than risk corruption. */
+static int name_ok(const char *s) {
+  if (!s || !*s)
+    return 0;
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (!(isalnum(c) || c == '-' || c == '_' || c == '.'))
+      return 0;
+  }
+  return 1;
+}
 
 static int sig_walk(const char *path, size_t *bytes, long *mtime, int depth) {
   DIR *d;
@@ -66,12 +82,13 @@ static void handle_title(const sd_cfg_t *cfg, const char *user,
                          int *nfail) {
   char src[SD_PATH_MAX];
   char zip_path[SD_PATH_MAX];
+  char state_path[SD_PATH_MAX];
   char drive_name[SD_PATH_MAX];
   size_t bytes = 0;
   long mtime = 0;
   time_t now;
   struct tm tmv = {0};
-  int rc;
+  int rc, resume;
 
   if (snprintf(src, sizeof src, SD_HOME "/%s/savedata/%s", user, title) >=
       (int)sizeof src) {
@@ -99,16 +116,27 @@ static void handle_title(const sd_cfg_t *cfg, const char *user,
   }
 
   if (snprintf(zip_path, sizeof zip_path, SD_DATA "/%s+%s.zip", user, title) >=
-      (int)sizeof zip_path) {
+          (int)sizeof zip_path ||
+      snprintf(state_path, sizeof state_path, SD_STATE_DIR "/%s+%s.state", user,
+               title) >= (int)sizeof state_path) {
     log_msg("TITLE %s+%s fail %zu", user, title, bytes);
     (*nfail)++;
     return;
   }
 
-  if (sd_zip_title(user, title, zip_path) != 0) {
-    log_msg("TITLE %s+%s fail %zu", user, title, bytes);
-    (*nfail)++;
-    return;
+  /* Resume an interrupted upload of the same saves; otherwise drop any
+   * leftovers from a different save state and build a fresh zip. */
+  resume = sd_drive_state_resumable(state_path, zip_path, bytes, mtime);
+  if (resume) {
+    log_msg("TITLE %s+%s resume %zu", user, title, bytes);
+  } else {
+    remove(state_path);
+    remove(zip_path);
+    if (sd_zip_title(user, title, zip_path) != 0) {
+      log_msg("TITLE %s+%s fail %zu", user, title, bytes);
+      (*nfail)++;
+      return;
+    }
   }
 
   now = time(NULL);
@@ -127,7 +155,8 @@ static void handle_title(const sd_cfg_t *cfg, const char *user,
     return;
   }
 
-  rc = sd_drive_put(cfg, zip_path, drive_name);
+  rc = sd_drive_put(cfg, zip_path, drive_name, state_path,
+                    (unsigned long long)bytes, mtime);
   if (rc == 0) {
     sd_manifest_record(user, title, bytes, mtime);
     remove(zip_path);
@@ -165,6 +194,10 @@ static void walk_savedata(const sd_cfg_t *cfg, const char *user, int *nzip,
       continue;
     if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode))
       continue;
+    if (!name_ok(de->d_name)) {
+      log_msg("WALK skip name %s", de->d_name);
+      continue;
+    }
     handle_title(cfg, user, de->d_name, nzip, nskip, nfail);
   }
   closedir(d);
@@ -179,6 +212,7 @@ int main(void) {
   int nfail = 0;
 
   mkdir(SD_DATA, 0700);
+  mkdir(SD_STATE_DIR, 0700);
   log_init(SD_LOG_FILE);
 
   if (sd_cfg_load(SD_CFG_FILE, &cfg) != 0) {
@@ -199,6 +233,10 @@ int main(void) {
         continue;
       if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode))
         continue;
+      if (!name_ok(de->d_name)) {
+        log_msg("WALK skip name %s", de->d_name);
+        continue;
+      }
       walk_savedata(&cfg, de->d_name, &nzip, &nskip, &nfail);
     }
     closedir(home);

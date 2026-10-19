@@ -130,17 +130,63 @@ typedef struct {
   size_t body_len;
 } sd_http_t;
 
+/* De-chunks a body in place. Returns the de-chunked length, or -1 when the
+ * framing is malformed; the caller then keeps the raw bytes (the status line
+ * is parsed either way). */
+static int dechunk(char *buf, size_t len) {
+  size_t in = 0, out = 0;
+  for (;;) {
+    size_t sz = 0;
+    int any = 0;
+    while (in < len) {
+      char c = buf[in];
+      int d;
+      if (c >= '0' && c <= '9')
+        d = c - '0';
+      else if (c >= 'a' && c <= 'f')
+        d = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F')
+        d = c - 'A' + 10;
+      else
+        break;
+      sz = sz * 16 + (size_t)d;
+      any = 1;
+      in++;
+      if (sz > (1u << 24))
+        return -1;
+    }
+    if (!any)
+      return -1;
+    while (in < len && buf[in] != '\n')
+      in++;
+    if (in >= len)
+      return -1;
+    in++; /* the size line's LF */
+    if (sz == 0)
+      return (int)out;
+    if (sz > len - in)
+      return -1;
+    memmove(buf + out, buf + in, sz);
+    out += sz;
+    in += sz;
+    if (in < len && buf[in] == '\r')
+      in++;
+    if (in < len && buf[in] == '\n')
+      in++;
+  }
+}
+
 /* Writes one request (headers, then optional binary body) and reads the full
  * response. Handles responses split across any number of io->read calls:
- * headers are accumulated until CRLFCRLF, Content-Length parsed, then exactly
- * that many body bytes are read. Returns 0 on a complete exchange, -2 on any
- * transport error. */
+ * headers are accumulated until CRLFCRLF, then either Content-Length bytes,
+ * a chunked body, or EOF for connection-close responses. Returns 0 on a
+ * complete exchange, -2 on any transport error. */
 static int sd_http_roundtrip(sd_io_t *io, const char *hdr, size_t hdr_len,
                              const void *body, size_t body_len, char *buf,
                              size_t cap, sd_http_t *out) {
-  size_t len = 0, hdr_end = 0, scan = 0;
+  size_t len = 0, hdr_end = 0, scan = 0, tscan = 0;
   long clen = -1;
-  int have_hdr = 0;
+  int have_hdr = 0, chunked = 0, body_done = 0;
 
   if (io_write_all(io, hdr, hdr_len) != 0)
     return -2;
@@ -148,7 +194,9 @@ static int sd_http_roundtrip(sd_io_t *io, const char *hdr, size_t hdr_len,
     return -2;
 
   for (;;) {
-    if (have_hdr) {
+    if (have_hdr && body_done)
+      break;
+    if (have_hdr && !chunked) {
       if (clen < 0 || len >= hdr_end + (size_t)clen)
         break;
     }
@@ -176,16 +224,35 @@ static int sd_http_roundtrip(sd_io_t *io, const char *hdr, size_t hdr_len,
         }
       }
       scan = len >= 3 ? len - 3 : 0;
-      if (have_hdr)
-        clen = parse_content_length(buf, hdr_end);
+      if (have_hdr) {
+        size_t vlen = 0;
+        const char *v = header_find(buf, hdr_end, "Transfer-Encoding", &vlen);
+        chunked = v && vlen >= 7 && strncasecmp(v, "chunked", 7) == 0;
+        clen = chunked ? -1 : parse_content_length(buf, hdr_end);
+      }
+    } else if (chunked && !body_done) {
+      size_t i;
+      for (i = tscan; i + 5 <= len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '0' &&
+            buf[i + 3] == '\r' && buf[i + 4] == '\n') {
+          body_done = 1;
+          break;
+        }
+      }
+      tscan = len >= 4 ? len - 4 : 0;
     }
   }
 
   out->status = parse_status(buf, have_hdr ? hdr_end : len);
   out->body = buf + hdr_end;
   out->body_len = len > hdr_end ? len - hdr_end : 0;
-  if (clen >= 0 && (size_t)clen < out->body_len)
+  if (have_hdr && chunked) {
+    int dl = dechunk(buf + hdr_end, out->body_len);
+    if (dl >= 0)
+      out->body_len = (size_t)dl;
+  } else if (clen >= 0 && (size_t)clen < out->body_len) {
     out->body_len = (size_t)clen;
+  }
   return 0;
 }
 
@@ -298,6 +365,123 @@ static const char *strip_scheme_host(const char *loc) {
   p += 3;
   slash = strchr(p, '/');
   return slash ? slash : "/";
+}
+
+/* ------------------------------------------------------- session state file
+ *
+ * Persists a resumable session across boots so an interrupted upload of a
+ * multi-GB title continues instead of restarting:
+ *   line 1: <sig_bytes> <sig_mtime> <zip_total>
+ *   line 2: <session path>
+ *   line 3: <drive name>
+ * Written atomically (tmp + rename). All fields are validated on read. */
+
+#define SD_STATE_LINE_MAX (SD_LOC_MAX + 256)
+#define SD_STATE_NAME_MAX 512
+
+typedef struct {
+  unsigned long long sig_bytes;
+  long sig_mtime;
+  unsigned long total;
+  char loc[SD_LOC_MAX];
+  char name[SD_STATE_NAME_MAX];
+} sd_state_t;
+
+/* Control characters would corrupt the line format (and log output). */
+static int state_line_clean(const char *s) {
+  for (; *s; s++)
+    if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
+      return 0;
+  return 1;
+}
+
+static int state_get(const char *path, sd_state_t *st) {
+  FILE *f;
+  char line[SD_STATE_LINE_MAX];
+  size_t n;
+
+  memset(st, 0, sizeof *st);
+  f = fopen(path, "rb");
+  if (!f)
+    return -1;
+  if (!fgets(line, sizeof line, f) ||
+      sscanf(line, "%llu %ld %lu", &st->sig_bytes, &st->sig_mtime,
+             &st->total) != 3) {
+    fclose(f);
+    return -1;
+  }
+  if (!fgets(st->loc, sizeof st->loc, f)) {
+    fclose(f);
+    return -1;
+  }
+  n = strlen(st->loc);
+  if (n && st->loc[n - 1] == '\n')
+    st->loc[n - 1] = 0;
+  if (st->loc[0] != '/' || !state_line_clean(st->loc)) {
+    fclose(f);
+    return -1;
+  }
+  if (!fgets(st->name, sizeof st->name, f)) {
+    fclose(f);
+    return -1;
+  }
+  n = strlen(st->name);
+  if (n && st->name[n - 1] == '\n')
+    st->name[n - 1] = 0;
+  if (!st->name[0] || !state_line_clean(st->name)) {
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+  return 0;
+}
+
+static int state_put(const char *path, const sd_state_t *st) {
+  char tmp[sizeof st->loc + sizeof st->name + 32];
+  FILE *f;
+
+  if (!path || snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp)
+    return -1;
+  f = fopen(tmp, "wb");
+  if (!f)
+    return -1;
+  if (fprintf(f, "%llu %ld %lu\n%s\n%s\n", st->sig_bytes, st->sig_mtime,
+              st->total, st->loc, st->name) < 0 ||
+      fclose(f) != 0) {
+    remove(tmp);
+    return -1;
+  }
+  if (rename(tmp, path) != 0) {
+    remove(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+static void state_unlink(const char *path) {
+  if (path)
+    remove(path);
+}
+
+int sd_drive_state_resumable(const char *state_path, const char *zip_path,
+                             unsigned long long sig_bytes, long sig_mtime) {
+  sd_state_t st;
+  FILE *f;
+  long size;
+
+  if (!state_path || !zip_path)
+    return 0;
+  if (state_get(state_path, &st) != 0)
+    return 0;
+  if (st.sig_bytes != sig_bytes || st.sig_mtime != sig_mtime)
+    return 0;
+  f = fopen(zip_path, "rb");
+  if (!f)
+    return 0;
+  if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0)
+    size = -1;
+  fclose(f);
+  return size >= 0 && (unsigned long)size == st.total;
 }
 
 static int create_session(const sd_cfg_t *c, const char *token,
@@ -442,17 +626,27 @@ static int put_chunk(sd_io_t *io, const char *path, const char *token,
   return 0;
 }
 
-/* Empty status query using the documented Drive session-status form
- * ("bytes" star slash total) with no body. Used when a 308 claims every byte
- * is persisted but never completed. 0 = complete, -1 fatal, -2 retryable. */
+/* Empty PUT with the documented Drive session-status form ("bytes" star
+ * slash total). 0 on a complete exchange, -2 on transport error; the status
+ * and (for 308) the server's persisted range come back through the out
+ * params. Used both to finalize and to resume. */
+static int session_status(sd_io_t *io, const char *path, const char *token,
+                          unsigned long total, char *rbuf, size_t rcap,
+                          int *status_out, unsigned long *range_end,
+                          int *have_range) {
+  char range[96];
+  snprintf(range, sizeof range, "bytes */%lu", total);
+  return put_chunk(io, path, token, (const unsigned char *)"", 0, range, rbuf,
+                   rcap, status_out, range_end, have_range);
+}
+
+/* Finalize/complete a session that has every byte but no completion status.
+ * 0 = complete, -1 fatal, -2 retryable. */
 static int finalize_session(sd_io_t *io, const char *path, const char *token,
                             unsigned long total, char *rbuf, size_t rcap) {
-  char range[96];
   int status = 0;
-  int rc;
-  snprintf(range, sizeof range, "bytes */%lu", total);
-  rc = put_chunk(io, path, token, (const unsigned char *)"", 0, range, rbuf,
-                 rcap, &status, NULL, NULL);
+  int rc = session_status(io, path, token, total, rbuf, rcap, &status, NULL,
+                          NULL);
   if (rc != 0) {
     log_msg("drive: finalize network error");
     return -2;
@@ -465,18 +659,22 @@ static int finalize_session(sd_io_t *io, const char *path, const char *token,
   return (status >= 400 && status < 500) ? -1 : -2;
 }
 
-int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
-                    const char *drive_name, sd_io_t *io) {
+int sd_drive_put_io_state(const sd_cfg_t *c, const char *zip_path,
+                          const char *drive_name, sd_io_t *io,
+                          const char *state_path, unsigned long long sig_bytes,
+                          long sig_mtime) {
   char token[SD_TOKEN_MAX];
   char loc[SD_LOC_MAX];
   char range[96];
   char *rbuf;
   unsigned char *chunk;
-  const char *path;
+  const char *path = NULL;
+  const char *name = drive_name;
+  sd_state_t st;
   FILE *f;
   long fsz;
-  unsigned long total, start;
-  int rc, chunks, restarted;
+  unsigned long total, start = 0;
+  int rc, chunks = 0, restarted = 0, resumed = 0;
 
   if (!c || !zip_path || !drive_name || !io || !io->write || !io->read)
     return -1;
@@ -488,20 +686,6 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
   }
 
   log_msg("drive: start upload");
-
-  rc = get_access_token(c, io, token, sizeof token, rbuf, SD_RESP_MAX);
-  if (rc != 0) {
-    free(rbuf);
-    return rc;
-  }
-
-  rc = create_session(c, token, drive_name, io, rbuf, SD_RESP_MAX, loc,
-                      sizeof loc);
-  if (rc != 0) {
-    free(rbuf);
-    return rc;
-  }
-  path = strip_scheme_host(loc);
 
   f = fopen(zip_path, "rb");
   if (!f) {
@@ -518,6 +702,89 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
   }
   total = (unsigned long)fsz;
 
+  rc = get_access_token(c, io, token, sizeof token, rbuf, SD_RESP_MAX);
+  if (rc != 0) {
+    fclose(f);
+    free(rbuf);
+    return rc;
+  }
+
+  /* Cross-boot resume: a prior run left a state file describing a live
+   * resumable session for exactly this zip and savedata signature. Ask the
+   * session where it stands, then continue from there instead of starting
+   * over. */
+  if (state_path && state_get(state_path, &st) == 0 &&
+      st.sig_bytes == sig_bytes && st.sig_mtime == sig_mtime &&
+      st.total == total) {
+    int status = 0, have_range = 0;
+    unsigned long range_end = 0;
+    rc = session_status(io, st.loc, token, total, rbuf, SD_RESP_MAX, &status,
+                        &range_end, &have_range);
+    if (rc != 0) {
+      log_msg("drive: session query network error");
+      fclose(f);
+      free(rbuf);
+      return -2;
+    }
+    if (status == 200 || status == 201) {
+      log_msg("drive: already complete");
+      state_unlink(state_path);
+      fclose(f);
+      free(rbuf);
+      log_msg("drive: done rc=0 chunks=0");
+      return 0;
+    }
+    if (status == 308) {
+      if (have_range && range_end + 1 <= total)
+        start = range_end + 1;
+      else
+        start = 0;
+      /* The send loop reads from the current file offset, so position the
+       * zip at the server's persisted byte before the first chunk. */
+      if (fseek(f, (long)start, SEEK_SET) != 0) {
+        log_msg("drive: seek failed");
+        fclose(f);
+        free(rbuf);
+        return -2;
+      }
+      strncpy(loc, st.loc, sizeof loc - 1);
+      loc[sizeof loc - 1] = 0;
+      path = loc;
+      name = st.name;
+      resumed = 1;
+      log_msg("drive: resuming at %lu/%lu", start, total);
+    } else if (status == 429 || status >= 500) {
+      log_msg("drive: session query http %d", status);
+      fclose(f);
+      free(rbuf);
+      return -2;
+    } else {
+      log_msg("drive: stale session %d", status);
+      state_unlink(state_path);
+    }
+  }
+
+  if (!resumed) {
+    rc = create_session(c, token, name, io, rbuf, SD_RESP_MAX, loc, sizeof loc);
+    if (rc != 0) {
+      fclose(f);
+      free(rbuf);
+      return rc;
+    }
+    path = strip_scheme_host(loc);
+    if (state_path) {
+      sd_state_t out;
+      memset(&out, 0, sizeof out);
+      out.sig_bytes = sig_bytes;
+      out.sig_mtime = sig_mtime;
+      out.total = total;
+      strncpy(out.loc, path, sizeof out.loc - 1);
+      strncpy(out.name, name, sizeof out.name - 1);
+      if (state_put(state_path, &out) != 0)
+        log_msg("drive: state write failed");
+    }
+  }
+
   chunk = malloc(SD_DRIVE_CHUNK);
   if (!chunk) {
     log_msg("drive: oom");
@@ -526,14 +793,12 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
     return -1;
   }
 
-  rc = 0;
-  chunks = 0;
-
-  if (total == 0) {
+  if (total == 0 || (resumed && start >= total)) {
+    /* Nothing to send: either an (impossible in practice) empty zip or a
+     * resumed session that already holds every byte. */
     rc = finalize_session(io, path, token, total, rbuf, SD_RESP_MAX);
     chunks = 1;
   } else {
-    start = 0;
     restarted = 0;
     {
       int iters = 0;
@@ -622,8 +887,15 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
   fclose(f);
   free(chunk);
   free(rbuf);
+  if (rc == 0 || rc == -1)
+    state_unlink(state_path);
   log_msg("drive: done rc=%d chunks=%d", rc, chunks);
   return rc;
+}
+
+int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
+                    const char *drive_name, sd_io_t *io) {
+  return sd_drive_put_io_state(c, zip_path, drive_name, io, NULL, 0, 0);
 }
 
 /* ------------------------------------------------------------- PS4 entry */
@@ -763,7 +1035,8 @@ static int ps4_io_read(void *ctx, void *buf, size_t cap) {
 }
 
 int sd_drive_put(const sd_cfg_t *c, const char *zip_path,
-                 const char *drive_name) {
+                 const char *drive_name, const char *state_path,
+                 unsigned long long sig_bytes, long sig_mtime) {
   struct ps4_io p;
   sd_io_t io;
   int rc;
@@ -772,7 +1045,8 @@ int sd_drive_put(const sd_cfg_t *c, const char *zip_path,
   io.ctx = &p;
   io.write = ps4_io_write;
   io.read = ps4_io_read;
-  rc = sd_drive_put_io(c, zip_path, drive_name, &io);
+  rc = sd_drive_put_io_state(c, zip_path, drive_name, &io, state_path,
+                             sig_bytes, sig_mtime);
   ps4_io_close(&p);
   return rc;
 }
