@@ -6,3 +6,4 @@ __pycache__/
 .superpowers/
 config.json
 .DS_Store
+tests/test_sd_cfg
