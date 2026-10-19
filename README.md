@@ -83,7 +83,9 @@ because a pre-created `folder_id` cannot be addressed with `drive.file`.
 - Torn-read detection is size+mtime; a same-size rewrite inside one mtime
   second is not detected.
 - Empty titles are reported `skip`, not backed up.
-- First run over Wi-Fi can take a while for multi-GB save sets; it resumes on
+- First run over Wi-Fi can take a while for multi-GB save sets. Uploads are
+  resumable: a dropped connection or partially persisted chunk resumes from
+  the byte position the server reports, and an interrupted title retries on
   the next jailbreak.
 
 ## Credits

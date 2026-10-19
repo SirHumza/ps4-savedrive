@@ -178,14 +178,13 @@ int main(void) {
   int nskip = 0;
   int nfail = 0;
 
+  mkdir(SD_DATA, 0700);
   log_init(SD_LOG_FILE);
 
   if (sd_cfg_load(SD_CFG_FILE, &cfg) != 0) {
     log_msg("config %s unavailable", SD_CFG_FILE);
     return 0;
   }
-
-  mkdir(SD_DATA, 0700);
 
   home = opendir(SD_HOME);
   if (home) {

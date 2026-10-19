@@ -265,6 +265,10 @@ static int get_access_token(const sd_cfg_t *c, sd_io_t *io, char *token,
     log_msg("drive: token network error");
     return -2;
   }
+  if (r.status == 429 || r.status >= 500) {
+    log_msg("drive: token http %d", r.status);
+    return -2;
+  }
   if (r.status != 200) {
     log_msg("drive: token http %d", r.status);
     return -1;
@@ -331,6 +335,12 @@ static int create_session(const sd_cfg_t *c, const char *token,
                           "Content-Type: application/json\r\n"
                           "Content-Length: %zu\r\n\r\n",
                           SD_GOOGLE_HOST, token, jlen);
+  if (hlen >= need) {
+    free(hdr);
+    free(json);
+    log_msg("drive: session header overflow");
+    return -1;
+  }
   rc = sd_http_roundtrip(io, hdr, hlen, json, jlen, rbuf, rcap, &r);
   free(hdr);
   free(json);
@@ -342,7 +352,7 @@ static int create_session(const sd_cfg_t *c, const char *token,
     log_msg("drive: session http %d", r.status);
     return -1;
   }
-  if (r.status >= 500) {
+  if (r.status == 429 || r.status >= 500) {
     log_msg("drive: session http %d", r.status);
     return -2;
   }
@@ -363,17 +373,22 @@ static int create_session(const sd_cfg_t *c, const char *token,
 }
 
 /* One resumable PUT. Returns 0 on a complete exchange (status in *status_out),
- * -2 on transport error. *range_end is updated from a 308 Range header. */
+ * -2 on transport error. On a 308, *range_end is set to the last persisted
+ * byte from the Range header and *have_range is set when that header existed:
+ * the server may persist only part of the chunk sent, and the caller must
+ * resend from *range_end + 1. */
 static int put_chunk(sd_io_t *io, const char *path, const char *token,
                      const unsigned char *data, size_t len, const char *range,
                      char *rbuf, size_t rcap, int *status_out,
-                     unsigned long *range_end) {
+                     unsigned long *range_end, int *have_range) {
   size_t need = strlen(path) + strlen(token) + 256;
   char *hdr = malloc(need);
   sd_http_t r;
   int rc;
   size_t hlen;
 
+  if (have_range)
+    *have_range = 0;
   if (!hdr)
     return -2;
   hlen = (size_t)snprintf(hdr, need,
@@ -381,13 +396,18 @@ static int put_chunk(sd_io_t *io, const char *path, const char *token,
                           "Authorization: Bearer %s\r\nContent-Length: %zu\r\n"
                           "Content-Range: %s\r\n\r\n",
                           path, SD_GOOGLE_HOST, token, len, range);
+  if (hlen >= need) {
+    free(hdr);
+    log_msg("drive: put header overflow");
+    return -1;
+  }
   rc = sd_http_roundtrip(io, hdr, hlen, data, len, rbuf, rcap, &r);
   free(hdr);
   if (rc != 0)
     return -2;
   *status_out = r.status;
 
-  if (range_end && r.status == 308) {
+  if (have_range && r.status == 308) {
     size_t vlen = 0;
     const char *v = header_find(rbuf, (size_t)(r.body - rbuf), "Range", &vlen);
     if (v && vlen) {
@@ -403,31 +423,60 @@ static int put_chunk(sd_io_t *io, const char *path, const char *token,
         if (i < vlen && v[i] == '-') {
           i++;
           while (i < vlen && v[i] >= '0' && v[i] <= '9') {
+            if (last > 1844674407370955161UL) {
+              any = 0; /* parse overflow: fall back to a restart */
+              break;
+            }
             last = last * 10 + (unsigned long)(v[i] - '0');
             i++;
             any = 1;
           }
         }
       }
-      if (any)
+      if (any) {
         *range_end = last;
+        *have_range = 1;
+      }
     }
   }
   return 0;
+}
+
+/* Empty status query using the documented Drive session-status form
+ * ("bytes" star slash total) with no body. Used when a 308 claims every byte
+ * is persisted but never completed. 0 = complete, -1 fatal, -2 retryable. */
+static int finalize_session(sd_io_t *io, const char *path, const char *token,
+                            unsigned long total, char *rbuf, size_t rcap) {
+  char range[96];
+  int status = 0;
+  int rc;
+  snprintf(range, sizeof range, "bytes */%lu", total);
+  rc = put_chunk(io, path, token, (const unsigned char *)"", 0, range, rbuf,
+                 rcap, &status, NULL, NULL);
+  if (rc != 0) {
+    log_msg("drive: finalize network error");
+    return -2;
+  }
+  if (status == 200 || status == 201) {
+    log_msg("drive: finalize ok");
+    return 0;
+  }
+  log_msg("drive: finalize http %d", status);
+  return (status >= 400 && status < 500) ? -1 : -2;
 }
 
 int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
                     const char *drive_name, sd_io_t *io) {
   char token[SD_TOKEN_MAX];
   char loc[SD_LOC_MAX];
-  char range[64];
+  char range[96];
   char *rbuf;
   unsigned char *chunk;
   const char *path;
   FILE *f;
   long fsz;
   unsigned long total, start;
-  int rc, chunks;
+  int rc, chunks, restarted;
 
   if (!c || !zip_path || !drive_name || !io || !io->write || !io->read)
     return -1;
@@ -481,73 +530,92 @@ int sd_drive_put_io(const sd_cfg_t *c, const char *zip_path,
   chunks = 0;
 
   if (total == 0) {
-    int status = 0;
-    rc = put_chunk(io, path, token, (const unsigned char *)"", 0,
-                   "bytes */0", rbuf, SD_RESP_MAX, &status, NULL);
-    if (rc != 0)
-      rc = -2;
-    else if (status >= 400 && status < 500)
-      rc = -1;
-    else if (status == 200 || status == 201)
-      rc = 0;
-    else
-      rc = -2;
+    rc = finalize_session(io, path, token, total, rbuf, SD_RESP_MAX);
     chunks = 1;
   } else {
     start = 0;
-    while (start < total) {
-      size_t want = (size_t)(total - start);
-      size_t got;
-      unsigned long end, range_end;
-      int status = 0;
+    restarted = 0;
+    {
+      int iters = 0;
+      int it_max = (int)(total / (unsigned long)SD_DRIVE_CHUNK) * 4 + 32;
+      while (start < total) {
+        size_t want = (size_t)(total - start);
+        size_t got;
+        unsigned long end, range_end = 0;
+        int status = 0, have_range = 0;
 
-      if (want > (size_t)SD_DRIVE_CHUNK)
-        want = (size_t)SD_DRIVE_CHUNK;
-      got = fread(chunk, 1, want, f);
-      if (got != want) {
-        log_msg("drive: read failed");
-        rc = -2;
-        break;
-      }
-      end = start + (unsigned long)got - 1;
-      snprintf(range, sizeof range, "bytes %lu-%lu/%lu", start, end, total);
-
-      range_end = end;
-      rc = put_chunk(io, path, token, chunk, got, range, rbuf, SD_RESP_MAX,
-                     &status, &range_end);
-      if (rc != 0) {
-        log_msg("drive: put network error");
-        rc = -2;
-        break;
-      }
-      chunks++;
-      log_msg("drive: chunk %d status %d sent %lu/%lu", chunks, status, end + 1,
-              total);
-
-      if (status == 308) {
-        unsigned long next = end + 1;
-        if (range_end >= start && range_end + 1 > next)
-          next = range_end + 1;
-        start = next;
-        if (fseek(f, (long)start, SEEK_SET) != 0) {
-          log_msg("drive: reseek failed");
+        if (++iters > it_max) {
+          log_msg("drive: too many resume attempts");
           rc = -2;
           break;
         }
-        continue;
-      }
-      if (status == 200 || status == 201) {
-        rc = 0;
+        if (want > (size_t)SD_DRIVE_CHUNK)
+          want = (size_t)SD_DRIVE_CHUNK;
+        got = fread(chunk, 1, want, f);
+        if (got != want) {
+          log_msg("drive: read failed");
+          rc = -2;
+          break;
+        }
+        end = start + (unsigned long)got - 1;
+        snprintf(range, sizeof range, "bytes %lu-%lu/%lu", start, end, total);
+
+        rc = put_chunk(io, path, token, chunk, got, range, rbuf, SD_RESP_MAX,
+                       &status, &range_end, &have_range);
+        if (rc != 0) {
+          log_msg("drive: put network error");
+          rc = -2;
+          break;
+        }
+        chunks++;
+        log_msg("drive: chunk %d status %d sent %lu/%lu", chunks, status,
+                end + 1, total);
+
+        if (status == 308) {
+          if (!have_range) {
+            /* Server kept nothing: restart once from zero, then give up. */
+            if (restarted) {
+              log_msg("drive: no resume position twice");
+              rc = -2;
+              break;
+            }
+            restarted = 1;
+            start = 0;
+          } else {
+            unsigned long next = range_end + 1;
+            if (next == 0 || next > total) {
+              log_msg("drive: bad resume position");
+              rc = -2;
+              break;
+            }
+            if (next >= total) {
+              /* Every byte persisted but the server did not complete the
+               * upload: ask it to finalize, as the API documents. */
+              rc = finalize_session(io, path, token, total, rbuf, SD_RESP_MAX);
+              break;
+            }
+            start = next;
+          }
+          if (fseek(f, (long)start, SEEK_SET) != 0) {
+            log_msg("drive: reseek failed");
+            rc = -2;
+            break;
+          }
+          continue;
+        }
+        if (status == 200 || status == 201) {
+          rc = 0;
+          break;
+        }
+        if (status >= 400 && status < 500) {
+          log_msg("drive: fatal http %d", status);
+          rc = -1;
+          break;
+        }
+        log_msg("drive: retryable http %d", status);
+        rc = -2;
         break;
       }
-      if (status >= 400 && status < 500) {
-        log_msg("drive: fatal http %d", status);
-        rc = -1;
-        break;
-      }
-      log_msg("drive: retryable http %d", status);
-      rc = -2;
-      break;
     }
   }
 
@@ -622,10 +690,15 @@ static void ps4_io_close(struct ps4_io *p) {
   p->host[0] = 0;
 }
 
-/* Host: <value> out of a just-built request. */
+/* Host: <value> out of a just-built request. Only a buffer that starts with a
+ * request line is considered: chunk bodies are binary and could otherwise
+ * contain bytes that look like a Host header. */
 static const char *req_host(const char *req, size_t len, char *out,
                             size_t cap) {
   size_t i;
+  if (len < 5 ||
+      (strncmp(req, "POST ", 5) != 0 && strncmp(req, "PUT ", 4) != 0))
+    return NULL;
   for (i = 0; i + 6 <= len; i++) {
     if ((req[i] == 'H' || req[i] == 'h') && strncasecmp(req + i, "Host:", 5) == 0) {
       size_t j = i + 5, o = 0;
@@ -643,7 +716,12 @@ static const char *req_host(const char *req, size_t len, char *out,
 static int ps4_io_write(void *ctx, const void *buf, size_t len) {
   struct ps4_io *p = (struct ps4_io *)ctx;
   char host[64];
-  if (!req_host((const char *)buf, len, host, sizeof host)) {
+  if (req_host((const char *)buf, len, host, sizeof host)) {
+    if (strcmp(host, SD_TOKEN_HOST) != 0 && strcmp(host, SD_GOOGLE_HOST) != 0) {
+      log_msg("drive: refusing unknown host");
+      return -1;
+    }
+  } else {
     if (!p->host[0])
       return -1;
     strcpy(host, p->host);

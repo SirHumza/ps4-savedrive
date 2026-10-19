@@ -5,6 +5,10 @@
  * every request line, header and body length so the protocol can be asserted
  * without any external dependency. Compiled with -DSD_DRIVE_CHUNK=64 so a
  * 200-byte fixture forces 4 resumable PUTs (resume exercised).
+ *
+ * Modes: 0 normal, 1 token 401, 2 session 503, 3 token 500, 4 partial chunk
+ * receipt (server keeps only 32 bytes of the first 64), 5 PUT 403, 6 server
+ * persists everything but never completes (status query path).
  */
 #include <arpa/inet.h>
 #include <assert.h>
@@ -40,10 +44,12 @@ typedef struct {
   int session_path_ok;
   int session_body_ok;
   int put_auth_ok;
+  int finalize_seen;
 
   unsigned long put_start[MAXREQ];
   unsigned long put_end[MAXREQ];
   unsigned long put_total[MAXREQ];
+  unsigned char put_first[MAXREQ];
   req_line_t req[MAXREQ];
 } srv_t;
 
@@ -153,6 +159,8 @@ static void *server_thread(void *arg) {
       s->refresh_body_ok = strstr(body, "grant_type=refresh_token") != NULL;
       if (s->mode == 1) {
         send_response(fd, 401, "Unauthorized", "", NULL);
+      } else if (s->mode == 3) {
+        send_response(fd, 500, "Internal Server Error", "", NULL);
       } else {
         send_response(fd, 200, "OK", "",
                       "{\"access_token\":\"test-token-123\",\"expires_in\":3600}");
@@ -183,11 +191,27 @@ static void *server_thread(void *arg) {
       s->put_start[i] = st;
       s->put_end[i] = en;
       s->put_total[i] = tot;
+      s->put_first[i] = blen > 0 ? (unsigned char)body[0] : 0;
       if (!(az && strncmp(az, "Bearer test-token-123", 21) == 0))
         s->put_auth_ok = 0;
       s->put_count++;
 
-      if (en + 1 < tot) {
+      if (cr && strstr(cr, "*/")) {
+        /* Session-status query: report the upload complete. */
+        s->finalize_seen = 1;
+        send_response(fd, 200, "OK", "", "{\"id\":\"file-id\"}");
+      } else if (s->mode == 5) {
+        send_response(fd, 403, "Forbidden", "", NULL);
+      } else if (s->mode == 4 && s->put_count == 1) {
+        /* Persist only half of the first chunk. */
+        send_response(fd, 308, "Resume Incomplete", "Range: bytes=0-31\r\n",
+                      NULL);
+      } else if (s->mode == 6 && en + 1 >= tot) {
+        /* Every byte persisted, but never the completion status. */
+        char extra[64];
+        snprintf(extra, sizeof extra, "Range: bytes=0-%lu\r\n", en);
+        send_response(fd, 308, "Resume Incomplete", extra, NULL);
+      } else if (en + 1 < tot) {
         char extra[64];
         snprintf(extra, sizeof extra, "Range: bytes=0-%lu\r\n", en);
         send_response(fd, 308, "Resume Incomplete", extra, NULL);
@@ -338,6 +362,7 @@ int main(void) {
     assert(s.put_total[i] == 200);
     assert(s.put_start[i] == exp_start);
     assert(s.put_end[i] == (exp_end < 199UL ? exp_end : 199UL));
+    assert(s.put_first[i] == (unsigned char)('A' + (exp_start % 26)));
   }
   assert(s.put_end[s.put_count - 1] == 199);
 
@@ -362,6 +387,36 @@ int main(void) {
   rc = run_scenario(2, fixture, "test-drive-name.zip", &s);
   assert(rc == -2);
   assert(s.token_seen && s.session_seen && s.put_count == 0);
+
+  /* --- token 500 is retryable ------------------------------------------ */
+  rc = run_scenario(3, fixture, "test-drive-name.zip", &s);
+  assert(rc == -2);
+  assert(s.token_seen && s.put_count == 0);
+
+  /* --- partial chunk receipt: resend from the server's position -------- */
+  rc = run_scenario(4, fixture, "test-drive-name.zip", &s);
+  assert(rc == 0);
+  assert(s.put_count == 4);
+  assert(s.put_start[0] == 0 && s.put_end[0] == 63);
+  assert(s.put_start[1] == 32 && s.put_end[1] == 95);
+  assert(s.put_start[2] == 96 && s.put_end[2] == 159);
+  assert(s.put_start[3] == 160 && s.put_end[3] == 199);
+  for (i = 0; i < s.put_count; i++) {
+    unsigned long st = s.put_start[i];
+    assert(s.put_total[i] == 200);
+    assert(s.put_first[i] == (unsigned char)('A' + (st % 26)));
+  }
+
+  /* --- PUT 403 is fatal ------------------------------------------------ */
+  rc = run_scenario(5, fixture, "test-drive-name.zip", &s);
+  assert(rc == -1);
+  assert(s.put_count == 1);
+
+  /* --- 308 covering the last byte: status query completes the upload --- */
+  rc = run_scenario(6, fixture, "test-drive-name.zip", &s);
+  assert(rc == 0);
+  assert(s.finalize_seen);
+  assert(s.put_count == 5);
 
   unlink(fixture);
   free(fixture);
