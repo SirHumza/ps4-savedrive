@@ -4,7 +4,7 @@
 
 **Goal:** A PS4 payload that zips both users' raw savedata and uploads it to Google Drive, running on every jailbreak.
 
-**Architecture:** Standalone repo. Common modules (`tls.c` + CA bundle, `jsonlite.c`, `log.c`, BearSSL objects, Makefile patterns) vendored from SirHumza/orbisRPC with attribution in the README. One-time Mac-side Python helper provisions a Google OAuth refresh token into `/data/savedrive/config.json`; the payload swaps it for an access token at runtime and does Drive resumable uploads, one zip per title, skipping unchanged titles via a manifest.
+**Architecture:** Standalone repo. Common modules (`tls.c` + CA bundle, `jsonlite.c`, `log.c`, mbedTLS objects, Makefile patterns) vendored from SirHumza/orbisRPC with attribution in the README. One-time Mac-side Python helper provisions a Google OAuth refresh token into `/data/savedrive/config.json`; the payload swaps it for an access token at runtime and does Drive resumable uploads, one zip per title, skipping unchanged titles via a manifest.
 
 **Tech Stack:** C (OpenOrbis SDK, daemon-world libs only), miniz (public domain zip), Google Drive resumable upload API, Python 3 (provisioning helper + host tests).
 
