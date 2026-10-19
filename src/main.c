@@ -1,7 +1,7 @@
 /* savedrive payload: zip every save title and upload it to Google Drive.
  *
- * Runs once per jailbreak from the payload autorun list. It never blocks
- * boot: every failure is logged and the payload still exits 0. */
+ * Sent to GoldHEN's PayLoader (port 9090) once per jailbreak. It never
+ * blocks boot: every failure is logged and the payload still exits 0. */
 #include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
