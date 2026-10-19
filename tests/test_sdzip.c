@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,21 @@ static void put(const char *path, const char *body, int len) {
   assert(f);
   assert(fwrite(body, 1, len, f) == (size_t)len);
   fclose(f);
+}
+
+/* Appends to a file mid-zip so the torn-read check has something to catch.
+ * (Same-size, same-second rewrites are not detected: mtime is 1s granular
+ * on the payload libc, so the signature is size + mtime seconds.) */
+static void *torn_writer(void *arg) {
+  const char *path = (const char *)arg;
+  int fd;
+  usleep(20000);
+  fd = open(path, O_WRONLY | O_APPEND);
+  if (fd >= 0) {
+    assert(write(fd, "Z", 1) == 1);
+    close(fd);
+  }
+  return NULL;
 }
 
 static void check_zip(const char *zip) {
@@ -68,6 +85,8 @@ int main(void) {
     put(p, body, 100);
     snprintf(p, sizeof p, "%s/c.dat", sub);
     put(p, "1234567", 7);
+    snprintf(p, sizeof p, "%s/ignored-link", dir);
+    assert(symlink("/etc/passwd", p) == 0);
   }
 
   assert(sd_zip_dir(dir, zip) == 0);
@@ -75,6 +94,26 @@ int main(void) {
 
   assert(sd_zip_dir(empty, zip) == -1);
   assert(access(zip, F_OK) != 0);
+
+  {
+    char tdir[512], tzip[512], big[512];
+    pthread_t th;
+    int fd;
+
+    snprintf(tdir, sizeof tdir, "%s/torn", root);
+    snprintf(big, sizeof big, "%s/big.bin", tdir);
+    snprintf(tzip, sizeof tzip, "%s/torn.zip", root);
+    assert(mkdir(tdir, 0700) == 0);
+    fd = open(big, O_WRONLY | O_CREAT, 0600);
+    assert(fd >= 0);
+    assert(ftruncate(fd, 256 * 1024 * 1024) == 0);
+    close(fd);
+
+    assert(pthread_create(&th, NULL, torn_writer, big) == 0);
+    assert(sd_zip_dir(tdir, tzip) == -1);
+    pthread_join(th, NULL);
+    assert(access(tzip, F_OK) != 0);
+  }
 
   assert(setenv("SD_MANIFEST_PATH", manifest, 1) == 0);
   assert(sd_manifest_skip("1898cd02", "CUSA00001", 112, 1000) == 0);
@@ -87,7 +126,6 @@ int main(void) {
 
   snprintf(cmd, sizeof cmd, "rm -rf '%s' /tmp/sdzip_a", root);
   assert(system(cmd) == 0);
-
   puts("PASS test_sdzip");
   return 0;
 }

@@ -12,7 +12,7 @@ static int copy_field(const jl_val_t *root, const char *key, char *dst,
   const jl_val_t *v = jl_obj_get(root, key);
   if (!v || v->type != JL_STRING || !v->str || v->strlen == 0)
     return -1;
-  if (v->strlen >= dst_size)
+  if (v->strlen >= dst_size || memchr(v->str, '\0', v->strlen))
     return -1;
   memcpy(dst, v->str, v->strlen);
   dst[v->strlen] = '\0';

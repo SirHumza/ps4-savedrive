@@ -4,6 +4,7 @@
 Prints config.json for the user to FTP to /data/savedrive/config.json.
 Never writes the token to disk on this machine.
 """
+import getpass
 import json
 import sys
 import urllib.parse
@@ -12,6 +13,9 @@ import urllib.request
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REDIRECT_URI = "http://localhost"
+# Full drive scope, not drive.file: drive.file cannot address a folder the
+# user created ahead of time, and folder_id is part of the config contract.
+# The refresh token is long-lived; treat config.json as a credential.
 SCOPE = "https://www.googleapis.com/auth/drive"
 
 HELP = """\
@@ -20,11 +24,14 @@ ps4-savedrive provisioning
 1. Cloud Console: create or pick a Google Cloud project.
 2. Enable the Google Drive API, then create an OAuth client of type
    "Desktop app". Keep the client id and client secret.
-3. This script prints an auth URL. Open it, approve the drive scope, and
+3. Create the Drive folder to back up into and copy its folder id.
+4. This script prints an auth URL. Open it, approve the drive scope, and
    copy the code parameter from the browser address bar (the page itself
-   will fail to load, that is expected).
-4. Paste the code here. The script prints the config JSON block; FTP it to
-   /data/savedrive/config.json.
+   will fail to load, that is expected). Then paste the code back here.
+
+Without flags the script prompts interactively for the client id, the
+client secret (hidden input) and the folder id. The script prints the
+config JSON block; FTP it to /data/savedrive/config.json.
 
 Usage: python3 provision.py [--client-id ID --client-secret SECRET --folder-id ID]
 """
@@ -80,9 +87,11 @@ def config_json(client_id, client_secret, refresh_token, folder_id):
 
 
 def arg(name):
-    if name in sys.argv:
-        return sys.argv[sys.argv.index(name) + 1]
-    return None
+    if name not in sys.argv:
+        return None
+    if sys.argv.index(name) + 1 >= len(sys.argv):
+        raise SystemExit(f"{name} needs a value")
+    return sys.argv[sys.argv.index(name) + 1]
 
 
 def main():
@@ -91,7 +100,7 @@ def main():
         return
 
     client_id = arg("--client-id") or input("OAuth client id: ").strip()
-    client_secret = arg("--client-secret") or input("OAuth client secret: ").strip()
+    client_secret = arg("--client-secret") or getpass.getpass("OAuth client secret: ").strip()
     folder_id = arg("--folder-id") or input("Drive folder id: ").strip()
 
     print("\nOpen this URL and approve access:\n")
@@ -100,7 +109,11 @@ def main():
 
     pasted = input("Paste the code (or the full redirect URL): ").strip()
     if "code=" in pasted:
-        pasted = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)["code"][0]
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+        code = query.get("code")
+        if not code:
+            raise SystemExit("the URL has no code parameter (was access denied?)")
+        pasted = code[0]
 
     token = exchange_code(client_id, client_secret, pasted)
     print("\nSave this as /data/savedrive/config.json:\n")

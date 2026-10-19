@@ -51,7 +51,9 @@ int main(void) {
   free(ok);
 
   assert(sd_cfg_load("/nonexistent/config.json", &c) == -1);
-  assert(sd_cfg_redact(c.refresh_token) != NULL);
+  assert(strcmp(sd_cfg_redact("secret-token"), "***") == 0);
+  assert(strcmp(sd_cfg_redact(""), "(none)") == 0);
+  assert(strcmp(sd_cfg_redact(NULL), "(none)") == 0);
 
   puts("PASS test_sd_cfg");
   return 0;

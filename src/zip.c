@@ -10,6 +10,7 @@
 #include "miniz.h"
 
 #define SD_ZIP_MAX_FILES 8192
+#define SD_ZIP_MAX_DEPTH 64
 #define SD_ZIP_PATH_MAX 1024
 
 typedef struct {
@@ -47,11 +48,11 @@ static int add_entry(entries_t *e, const char *full, const char *rel,
   return 0;
 }
 
-static int walk(entries_t *e, const char *dir, const char *prefix) {
+static int walk(entries_t *e, const char *dir, const char *prefix, int depth) {
   DIR *d = opendir(dir);
   struct dirent *de;
 
-  if (!d)
+  if (!d || depth > SD_ZIP_MAX_DEPTH)
     return -1;
   while ((de = readdir(d))) {
     char full[SD_ZIP_PATH_MAX];
@@ -61,17 +62,26 @@ static int walk(entries_t *e, const char *dir, const char *prefix) {
     if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
       continue;
     if (snprintf(full, sizeof full, "%s/%s", dir, de->d_name) >=
-        (int)sizeof full)
-      continue;
-    if (prefix && *prefix)
-      snprintf(rel, sizeof rel, "%s/%s", prefix, de->d_name);
-    else
-      snprintf(rel, sizeof rel, "%s", de->d_name);
+        (int)sizeof full) {
+      closedir(d);
+      return -1;
+    }
+    if (prefix && *prefix) {
+      if (snprintf(rel, sizeof rel, "%s/%s", prefix, de->d_name) >=
+          (int)sizeof rel) {
+        closedir(d);
+        return -1;
+      }
+    } else if (snprintf(rel, sizeof rel, "%s", de->d_name) >=
+               (int)sizeof rel) {
+      closedir(d);
+      return -1;
+    }
 
     if (lstat(full, &st) != 0)
       continue;
     if (S_ISDIR(st.st_mode)) {
-      if (walk(e, full, rel) != 0) {
+      if (walk(e, full, rel, depth + 1) != 0) {
         closedir(d);
         return -1;
       }
@@ -86,18 +96,31 @@ static int walk(entries_t *e, const char *dir, const char *prefix) {
   return 0;
 }
 
-static int unchanged(const entries_t *e) {
+/* Re-walk after zipping and require the exact same set. Catches files
+ * created or deleted mid-zip, not just changes to the recorded ones. */
+static int unchanged_tree(const char *root, const entries_t *a) {
+  entries_t b = {0};
   size_t i;
+  int ok = 1;
 
-  for (i = 0; i < e->n; i++) {
-    struct stat st;
-    if (lstat(e->v[i].full, &st) != 0)
-      return 0;
-    if (!S_ISREG(st.st_mode) || (long long)st.st_size != e->v[i].size ||
-        (long long)st.st_mtime != e->v[i].mtime)
-      return 0;
+  if (walk(&b, root, "", 0) != 0 || b.n != a->n) {
+    free(b.v);
+    return 0;
   }
-  return 1;
+  for (i = 0; i < a->n && ok; i++) {
+    size_t j;
+    ok = 0;
+    for (j = 0; j < b.n; j++) {
+      if (strcmp(a->v[i].rel, b.v[j].rel) == 0 &&
+          a->v[i].size == b.v[j].size &&
+          a->v[i].mtime == b.v[j].mtime) {
+        ok = 1;
+        break;
+      }
+    }
+  }
+  free(b.v);
+  return ok;
 }
 
 static int write_zip(const entries_t *e, const char *out_zip) {
@@ -130,12 +153,12 @@ int sd_zip_dir(const char *src_dir, const char *out_zip) {
   if (!src_dir || !out_zip)
     return -1;
 
-  rc = walk(&e, src_dir, "");
+  rc = walk(&e, src_dir, "", 0);
   if (rc == 0 && e.n == 0)
     rc = -1;
   if (rc == 0)
     rc = write_zip(&e, out_zip);
-  if (rc == 0 && !unchanged(&e))
+  if (rc == 0 && !unchanged_tree(src_dir, &e))
     rc = -1;
   if (rc != 0)
     remove(out_zip);
