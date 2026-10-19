@@ -162,7 +162,8 @@ static void handle_title(const sd_cfg_t *cfg, const char *user,
   rc = sd_drive_put(cfg, zip_path, drive_name, state_path,
                     (unsigned long long)bytes, mtime);
   if (rc == 0) {
-    sd_manifest_record(user, title, bytes, mtime);
+    if (sd_manifest_record(user, title, bytes, mtime) != 0)
+      log_msg("MANIFEST write fail %s+%s (will re-upload)", user, title);
     remove(zip_path);
     log_msg("TITLE %s+%s zip %zu", user, title, bytes);
     (*nzip)++;
@@ -185,8 +186,10 @@ static void walk_savedata(const sd_cfg_t *cfg, const char *user, int *nzip,
       (int)sizeof dir)
     return;
   d = opendir(dir);
-  if (!d)
+  if (!d) {
+    log_msg("WALK no savedata for %s", user);
     return;
+  }
   while ((de = readdir(d)) != NULL) {
     char path[SD_PATH_MAX];
     struct stat st;
@@ -260,6 +263,8 @@ int main(void) {
       walk_savedata(&cfg, de->d_name, &nzip, &nskip, &nfail);
     }
     closedir(home);
+  } else {
+    log_msg("HOME %s unreadable", SD_HOME);
   }
 
   log_msg("SUMMARY zip=%d skip=%d fail=%d", nzip, nskip, nfail);
